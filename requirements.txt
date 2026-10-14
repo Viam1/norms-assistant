@@ -1,7 +1,9 @@
 streamlit
 pypdf
-chromadb==0.5.0
-sentence-transformers
-torch
-transformers
+chromadb==0.4.24
+sentence-transformers==2.7.0
+torch==2.2.2
+torchvision==0.17.2
+transformers==4.40.2
 requests
+numpy<2.0
