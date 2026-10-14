@@ -1,9 +1,10 @@
 import os
 import streamlit as st
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
-import chromadb
+import numpy as np
 import requests
+
+st.set_page_config(page_title="Помощник по нормам", layout="wide")
 
 # Заголовок
 st.title("📋 Помощник по нормам проектирования")
@@ -31,40 +32,32 @@ def split_text(text, chunk_size=800, overlap=100):
         start += chunk_size - overlap
     return chunks
 
-# Загрузка и индексация документов
-@st.cache_resource
-def load_and_index_documents():
+# Простой поиск по ключевым словам (без векторной БД — надёжнее)
+def search_chunks(chunks_data, query, top_k=3):
+    query_words = set(query.lower().split())
+    scored = []
+    for chunk in chunks_data:
+        text_lower = chunk['text'].lower()
+        score = sum(1 for word in query_words if word in text_lower)
+        if score > 0:
+            scored.append((score, chunk))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item[1] for item in scored[:top_k]]
+
+# Загрузка документов
+@st.cache_data
+def load_documents():
     docs_dir = "./docs"
     
     if not os.path.exists(docs_dir):
-        return None, None, None
-    
-    # Инициализация ChromaDB (новый API)
-    client = chromadb.PersistentClient(path="./chroma_db")
-    
-    # Создаем или получаем коллекцию
-    collection = client.get_or_create_collection(
-        name="norms_documents",
-        metadata={"hnsw:space": "cosine"}
-    )
-    
-    # Если коллекция уже заполнена, возвращаем её
-    if collection.count() > 0:
-        st.info(f"База данных уже содержит {collection.count()} фрагментов.")
-        return client, collection, None
-    
-    # Загружаем модель эмбеддингов
-    model = SentenceTransformer('intfloat/multilingual-e5-small')
-    
-    # Обрабатываем все PDF
-    all_chunks = []
-    all_metadatas = []
-    all_ids = []
+        return None
     
     pdf_files = [f for f in os.listdir(docs_dir) if f.endswith('.pdf')]
     
     if not pdf_files:
-        return None, None, None
+        return None
+    
+    all_chunks = []
     
     for filename in pdf_files:
         pdf_path = os.path.join(docs_dir, filename)
@@ -76,33 +69,13 @@ def load_and_index_documents():
         chunks = split_text(text)
         
         for i, chunk in enumerate(chunks):
-            all_chunks.append(chunk)
-            all_metadatas.append({
+            all_chunks.append({
+                "text": chunk,
                 "source": filename,
                 "chunk_id": i
             })
-            all_ids.append(f"{filename}_{i}")
     
-    if not all_chunks:
-        return None, None, None
-    
-    # Создаем эмбеддинги
-    embeddings = model.encode(all_chunks, show_progress_bar=True).tolist()
-    
-    # Добавляем в ChromaDB (батчами по 100)
-    batch_size = 100
-    for i in range(0, len(all_chunks), batch_size):
-        end = i + batch_size
-        collection.add(
-            documents=all_chunks[i:end],
-            embeddings=embeddings[i:end],
-            metadatas=all_metadatas[i:end],
-            ids=all_ids[i:end]
-        )
-    
-    st.success(f"✅ Проиндексировано {len(all_chunks)} фрагментов из {len(pdf_files)} PDF.")
-    
-    return client, collection, model
+    return all_chunks
 
 # Функция для получения ответа от модели
 def get_answer_from_model(context, question):
@@ -142,47 +115,38 @@ def get_answer_from_model(context, question):
         return f"Ошибка при запросе к модели: {str(e)}"
 
 # Основная логика
-with st.spinner("Загрузка и индексация документов..."):
-    client, collection, model = load_and_index_documents()
+with st.spinner("Загрузка документов..."):
+    chunks_data = load_documents()
 
-if client and collection:
-    # Загружаем модель для эмбеддингов (если не была загружена)
-    if model is None:
-        model = SentenceTransformer('intfloat/multilingual-e5-small')
+if chunks_data:
+    st.success(f"✅ Загружено {len(chunks_data)} фрагментов из документов.")
     
     # Поле ввода
     question = st.text_input("Ваш вопрос:", placeholder="Например: Какие требования к высоте потолков?")
     
     if question:
         with st.spinner("Поиск ответа в документах..."):
-            # Создаем эмбеддинг запроса
-            query_embedding = model.encode([question]).tolist()
-            
             # Ищем релевантные фрагменты
-            results = collection.query(
-                query_embeddings=query_embedding,
-                n_results=3,
-                include=["documents", "metadatas"]
-            )
+            relevant_chunks = search_chunks(chunks_data, question, top_k=3)
             
-            if results['documents'] and len(results['documents'][0]) > 0:
+            if relevant_chunks:
                 # Формируем контекст
-                context = "\n\n---\n\n".join(results['documents'][0])
+                context = "\n\n---\n\n".join([chunk['text'] for chunk in relevant_chunks])
                 
                 # Получаем ответ от модели
                 answer = get_answer_from_model(context, question)
                 
                 # Показываем ответ
-                st.subheader("📝 Ответ:")
+                st.subheader(" Ответ:")
                 st.write(answer)
                 
                 # Показываем источники
-                st.subheader(" Источники:")
-                for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
-                    source = metadata.get('source', 'Неизвестный файл')
+                st.subheader("📚 Источники:")
+                for i, chunk in enumerate(relevant_chunks):
+                    source = chunk.get('source', 'Неизвестный файл')
                     st.write(f"**{i+1}. {source}**")
                     with st.expander("Показать фрагмент"):
-                        st.text(doc[:500] + "..." if len(doc) > 500 else doc)
+                        st.text(chunk['text'][:500] + "..." if len(chunk['text']) > 500 else chunk['text'])
             else:
                 st.warning("Не удалось найти релевантную информацию в документах.")
 else:
