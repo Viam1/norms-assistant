@@ -1,122 +1,95 @@
 import os
 import streamlit as st
 from pypdf import PdfReader
-import requests
 
-st.set_page_config(page_title="Помощник по нормам", layout="wide")
+st.set_page_config(page_title="Поиск по нормам", layout="wide")
 
-st.title(" Помощник по нормам проектирования")
-st.write("Задайте вопрос — ответ будет найден в загруженных документах.")
+st.title(" Умный поиск по нормам проектирования")
+st.write("Введите ключевые слова — система найдёт точные цитаты из документов.")
 
-# Проверка папки docs
+# 1. Проверка папки с файлами
 docs_dir = "./docs"
 if not os.path.exists(docs_dir):
-    st.error("❌ Папка docs не найдена. Загрузите PDF-файлы в репозиторий.")
+    st.error("❌ Папка docs не найдена.")
     st.stop()
 
 pdf_files = [f for f in os.listdir(docs_dir) if f.endswith('.pdf')]
 if not pdf_files:
-    st.error("❌ Папка docs пуста. Загрузите PDF-файлы.")
+    st.error("❌ Папка docs пуста.")
     st.stop()
 
-st.info(f"📁 Найдено PDF-файлов: {len(pdf_files)}")
-
-# Функция извлечения текста
-def extract_text_from_pdf(pdf_path):
+# 2. Функция чтения PDF (упрощённая и быстрая)
+def get_text_from_pdf(filepath):
+    text = ""
     try:
-        reader = PdfReader(pdf_path)
-        text = ""
-        for i, page in enumerate(reader.pages):
+        reader = PdfReader(filepath)
+        for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
-        return text
     except Exception as e:
-        return f"Ошибка чтения файла: {str(e)}"
+        text += f"\n[Ошибка чтения файла: {e}]\n"
+    return text
 
-# Загружаем только первые 3 PDF для теста
-st.info("⏳ Загружаю первые 3 документа для теста...")
-
-test_files = pdf_files[:3]
-all_text = ""
-
-for filename in test_files:
-    pdf_path = os.path.join(docs_dir, filename)
-    text = extract_text_from_pdf(pdf_path)
-    all_text += f"\n\n=== {filename} ===\n\n{text}"
-    st.text(f"✅ Загружен: {filename}")
-
-st.success(f"✅ Загружено {len(test_files)} документов. Общий объём текста: {len(all_text)} символов.")
-
-# Поле ввода
-question = st.text_input("Ваш вопрос:", placeholder="Например: Какие требования к высоте потолков?")
-
-if question:
-    with st.spinner("Поиск ответа..."):
-        # Простой поиск по ключевым словам
-        query_words = set(question.lower().split())
+# 3. Загрузка и разбивка на фрагменты (выполняется один раз)
+@st.cache_data(ttl=3600) # Кэшируем на 1 час, чтобы не зависало
+def load_and_split_all_docs():
+    all_chunks = []
+    # Берём все файлы, но ограничиваем размер для скорости
+    for filename in pdf_files:
+        filepath = os.path.join(docs_dir, filename)
+        full_text = get_text_from_pdf(filepath)
         
-        # Разбиваем текст на фрагменты по 500 символов
-        chunks = []
-        for i in range(0, len(all_text), 500):
-            chunk = all_text[i:i+500]
-            if chunk.strip():
-                chunks.append(chunk)
+        # Разбиваем текст на абзацы/предложения (примерно по 500-800 знаков)
+        # Используем разбивку по двойному переносу строки или просто по длине
+        paragraphs = full_text.split('\n\n')
         
-        # Ищем релевантные фрагменты
-        scored_chunks = []
+        for para in paragraphs:
+            clean_para = para.strip()
+            if 50 < len(clean_para) < 1500: # Берём только осмысленные куски
+                all_chunks.append({
+                    "text": clean_para,
+                    "source": filename
+                })
+    return all_chunks
+
+# 4. Основной интерфейс
+with st.spinner("⏳ Индексация документов (это займёт пару секунд)..."):
+    chunks = load_and_split_all_docs()
+
+if not chunks:
+    st.warning("Не удалось извлечь текст из PDF. Возможно, это сканы.")
+else:
+    st.success(f"✅ Готово! Проиндексировано {len(chunks)} фрагментов из {len(pdf_files)} файлов.")
+    
+    # Поле поиска
+    query = st.text_input("🔎 Что ищем?", placeholder="Например: высота потолков, вентиляция, освещение", key="search_box")
+    
+    if query:
+        query_lower = query.lower()
+        # Разбиваем запрос на слова для более точного поиска
+        search_words = query_lower.split()
+        
+        # Ищем фрагменты, где есть хотя бы одно слово из запроса
+        results = []
         for chunk in chunks:
-            chunk_lower = chunk.lower()
-            score = sum(1 for word in query_words if word in chunk_lower)
+            chunk_lower = chunk["text"].lower()
+            # Считаем, сколько слов из запроса найдено в фрагменте
+            score = sum(1 for word in search_words if word in chunk_lower)
             if score > 0:
-                scored_chunks.append((score, chunk))
+                results.append((score, chunk))
         
-        scored_chunks.sort(key=lambda x: x[0], reverse=True)
-        top_chunks = [item[1] for item in scored_chunks[:3]]
+        # Сортируем: сначала те, где больше совпадений
+        results.sort(key=lambda x: x[0], reverse=True)
         
-        if top_chunks:
-            context = "\n\n---\n\n".join(top_chunks)
-            
-            # Отправляем запрос к модели
-            API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-7B-Instruct"
-            
-            prompt = f"""Используй только следующую информацию из документов для ответа на вопрос. Если в документах нет ответа, скажи об этом.
-
-Контекст из документов:
-{context}
-
-Вопрос: {question}
-
-Ответ:"""
-            
-            payload = {
-                "inputs": prompt,
-                "parameters": {
-                    "max_new_tokens": 500,
-                    "temperature": 0.1,
-                    "return_full_text": False
-                }
-            }
-            
-            headers = {"Content-Type": "application/json"}
-            
-            try:
-                response = requests.post(API_URL, headers=headers, json=payload, timeout=60)
-                result = response.json()
-                
-                if isinstance(result, list) and len(result) > 0:
-                    answer = result[0].get('generated_text', 'Не удалось получить ответ')
-                else:
-                    answer = "Модель временно недоступна. Попробуйте через минуту."
-            except Exception as e:
-                answer = f"Ошибка: {str(e)}"
-            
-            st.subheader("📝 Ответ:")
-            st.write(answer)
-            
-            st.subheader(" Найденные фрагменты:")
-            for i, chunk in enumerate(top_chunks):
-                st.write(f"**Фрагмент {i+1}:**")
-                st.text(chunk[:300] + "..." if len(chunk) > 300 else chunk)
+        # Показываем топ-10 результатов
+        st.subheader(f"Найдено результатов: {len(results)}")
+        
+        if len(results) == 0:
+            st.info("Ничего не найдено. Попробуйте другие слова.")
         else:
-            st.warning("Не удалось найти релевантную информацию.")
+            for score, chunk in results[:10]:
+                with st.container():
+                    st.markdown(f"** Источник:** `{chunk['source']}`")
+                    st.markdown(f"**Текст:** {chunk['text']}")
+                    st.markdown("---")
