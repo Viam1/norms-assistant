@@ -3,9 +3,7 @@ import streamlit as st
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import chromadb
-from chromadb.config import Settings
 import requests
-import json
 
 # Заголовок
 st.title("📋 Помощник по нормам проектирования")
@@ -16,17 +14,20 @@ def extract_text_from_pdf(pdf_path):
     reader = PdfReader(pdf_path)
     text = ""
     for page in reader.pages:
-        text += page.extract_text() + "\n"
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
     return text
 
 # Функция для разбиения текста на фрагменты
-def split_text(text, chunk_size=1000, overlap=100):
+def split_text(text, chunk_size=800, overlap=100):
     chunks = []
     start = 0
     while start < len(text):
         end = start + chunk_size
         chunk = text[start:end]
-        chunks.append(chunk)
+        if chunk.strip():
+            chunks.append(chunk)
         start += chunk_size - overlap
     return chunks
 
@@ -36,20 +37,21 @@ def load_and_index_documents():
     docs_dir = "./docs"
     
     if not os.path.exists(docs_dir):
-        return None, None
+        return None, None, None
     
-    # Инициализация ChromaDB
-    client = chromadb.Client(Settings(
-        chroma_db_impl="duckdb+parquet",
-        persist_directory="./chroma_db"
-    ))
+    # Инициализация ChromaDB (новый API)
+    client = chromadb.PersistentClient(path="./chroma_db")
     
     # Создаем или получаем коллекцию
-    collection = client.get_or_create_collection(name="norms_documents")
+    collection = client.get_or_create_collection(
+        name="norms_documents",
+        metadata={"hnsw:space": "cosine"}
+    )
     
     # Если коллекция уже заполнена, возвращаем её
     if collection.count() > 0:
-        return client, collection
+        st.info(f"База данных уже содержит {collection.count()} фрагментов.")
+        return client, collection, None
     
     # Загружаем модель эмбеддингов
     model = SentenceTransformer('intfloat/multilingual-e5-small')
@@ -59,50 +61,51 @@ def load_and_index_documents():
     all_metadatas = []
     all_ids = []
     
-    for filename in os.listdir(docs_dir):
-        if filename.endswith('.pdf'):
-            pdf_path = os.path.join(docs_dir, filename)
-            text = extract_text_from_pdf(pdf_path)
-            chunks = split_text(text)
+    pdf_files = [f for f in os.listdir(docs_dir) if f.endswith('.pdf')]
+    
+    if not pdf_files:
+        return None, None, None
+    
+    for filename in pdf_files:
+        pdf_path = os.path.join(docs_dir, filename)
+        text = extract_text_from_pdf(pdf_path)
+        
+        if not text.strip():
+            continue
             
-            for i, chunk in enumerate(chunks):
-                all_chunks.append(chunk)
-                all_metadatas.append({
-                    "source": filename,
-                    "chunk_id": i
-                })
-                all_ids.append(f"{filename}_{i}")
+        chunks = split_text(text)
+        
+        for i, chunk in enumerate(chunks):
+            all_chunks.append(chunk)
+            all_metadatas.append({
+                "source": filename,
+                "chunk_id": i
+            })
+            all_ids.append(f"{filename}_{i}")
+    
+    if not all_chunks:
+        return None, None, None
     
     # Создаем эмбеддинги
-    embeddings = model.encode(all_chunks)
+    embeddings = model.encode(all_chunks, show_progress_bar=True).tolist()
     
-    # Добавляем в ChromaDB
-    collection.add(
-        documents=all_chunks,
-        embeddings=embeddings.tolist(),
-        metadatas=all_metadatas,
-        ids=all_ids
-    )
+    # Добавляем в ChromaDB (батчами по 100)
+    batch_size = 100
+    for i in range(0, len(all_chunks), batch_size):
+        end = i + batch_size
+        collection.add(
+            documents=all_chunks[i:end],
+            embeddings=embeddings[i:end],
+            metadatas=all_metadatas[i:end],
+            ids=all_ids[i:end]
+        )
     
-    # Сохраняем
-    client.persist()
+    st.success(f"✅ Проиндексировано {len(all_chunks)} фрагментов из {len(pdf_files)} PDF.")
     
-    return client, collection
-
-# Функция для поиска релевантных фрагментов
-def search_documents(collection, query, model, n_results=3):
-    query_embedding = model.encode([query]).tolist()
-    
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=n_results
-    )
-    
-    return results
+    return client, collection, model
 
 # Функция для получения ответа от модели
 def get_answer_from_model(context, question):
-    # Используем бесплатную модель через HuggingFace Inference API
     API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2.5-7B-Instruct"
     
     prompt = f"""Используй только следующую информацию из документов для ответа на вопрос. Если в документах нет ответа, скажи об этом.
@@ -131,6 +134,8 @@ def get_answer_from_model(context, question):
         
         if isinstance(result, list) and len(result) > 0:
             return result[0].get('generated_text', 'Не удалось получить ответ')
+        elif isinstance(result, dict) and 'error' in result:
+            return f"Модель загружается: {result['error']}. Попробуйте через минуту."
         else:
             return "Модель временно недоступна. Попробуйте через минуту."
     except Exception as e:
@@ -138,25 +143,31 @@ def get_answer_from_model(context, question):
 
 # Основная логика
 with st.spinner("Загрузка и индексация документов..."):
-    client, collection = load_and_index_documents()
+    client, collection, model = load_and_index_documents()
 
 if client and collection:
-    st.success(f"✅ Загружено документов: {len(os.listdir('./docs'))}")
-    
-    # Загружаем модель для эмбеддингов
-    model = SentenceTransformer('intfloat/multilingual-e5-small')
+    # Загружаем модель для эмбеддингов (если не была загружена)
+    if model is None:
+        model = SentenceTransformer('intfloat/multilingual-e5-small')
     
     # Поле ввода
     question = st.text_input("Ваш вопрос:", placeholder="Например: Какие требования к высоте потолков?")
     
     if question:
         with st.spinner("Поиск ответа в документах..."):
+            # Создаем эмбеддинг запроса
+            query_embedding = model.encode([question]).tolist()
+            
             # Ищем релевантные фрагменты
-            results = search_documents(collection, question, model, n_results=3)
+            results = collection.query(
+                query_embeddings=query_embedding,
+                n_results=3,
+                include=["documents", "metadatas"]
+            )
             
             if results['documents'] and len(results['documents'][0]) > 0:
                 # Формируем контекст
-                context = "\n\n".join(results['documents'][0])
+                context = "\n\n---\n\n".join(results['documents'][0])
                 
                 # Получаем ответ от модели
                 answer = get_answer_from_model(context, question)
@@ -166,7 +177,7 @@ if client and collection:
                 st.write(answer)
                 
                 # Показываем источники
-                st.subheader("📚 Источники:")
+                st.subheader(" Источники:")
                 for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
                     source = metadata.get('source', 'Неизвестный файл')
                     st.write(f"**{i+1}. {source}**")
