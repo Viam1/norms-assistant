@@ -2,11 +2,12 @@ import os
 import re
 import streamlit as st
 from pypdf import PdfReader
+import requests
 
 st.set_page_config(page_title="Поиск по нормам", layout="wide")
 
-st.title("🔍 Умный поиск по нормам проектирования")
-st.write("Введите запрос — система найдёт релевантные цитаты из документов.")
+st.title("🔍 Умный помощник по нормам проектирования")
+st.write("Задайте вопрос — система найдёт ответ в документах с точными цитатами.")
 
 # 1. Проверка папки с файлами
 docs_dir = "./docs"
@@ -19,7 +20,27 @@ if not pdf_files:
     st.error("❌ Папка docs пуста.")
     st.stop()
 
-# 2. Функция чтения PDF с извлечением текста постранично
+# 2. Боковая панель для API ключа
+with st.sidebar:
+    st.header("⚙️ Настройки")
+    groq_api_key = st.text_input(
+        "Groq API Key",
+        type="password",
+        help="Получите бесплатный ключ на console.groq.com",
+        value=""
+    )
+    
+    if not groq_api_key:
+        st.warning("️ Введите API ключ Groq для работы ИИ")
+        st.markdown("[Получить бесплатный ключ →](https://console.groq.com/)")
+    
+    st.divider()
+    st.markdown("**Как это работает:**")
+    st.markdown("1. Система ищет релевантные фрагменты в PDF")
+    st.markdown("2. ИИ анализирует их и формулирует ответ")
+    st.markdown("3. Вы получаете точный ответ с источником")
+
+# 3. Функция чтения PDF
 def get_text_from_pdf(filepath):
     pages_text = []
     try:
@@ -35,12 +56,9 @@ def get_text_from_pdf(filepath):
         pages_text.append({"page": 0, "text": f"[Ошибка чтения: {e}]"})
     return pages_text
 
-# 3. Умная разбивка текста на фрагменты
-def split_text_smart(text, chunk_size=500, overlap=100):
-    """Разбивает текст на фрагменты с перекрытием, стараясь не разрывать предложения"""
+# 4. Умная разбивка текста
+def split_text_smart(text, chunk_size=600, overlap=150):
     chunks = []
-    
-    # Сначала разбиваем по абзацам (двойной перенос строки)
     paragraphs = text.split('\n\n')
     
     current_chunk = ""
@@ -49,9 +67,7 @@ def split_text_smart(text, chunk_size=500, overlap=100):
         if not para:
             continue
         
-        # Если абзац очень длинный, разбиваем его по предложениям
         if len(para) > chunk_size:
-            # Разбиваем по точкам с пробелом
             sentences = re.split(r'(?<=[.!?])\s+', para)
             for sentence in sentences:
                 sentence = sentence.strip()
@@ -60,7 +76,6 @@ def split_text_smart(text, chunk_size=500, overlap=100):
                 
                 if len(current_chunk) + len(sentence) > chunk_size and current_chunk:
                     chunks.append(current_chunk.strip())
-                    # Оставляем перекрытие
                     overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else ""
                     current_chunk = overlap_text + " " + sentence
                 else:
@@ -78,7 +93,7 @@ def split_text_smart(text, chunk_size=500, overlap=100):
     
     return chunks
 
-# 4. Загрузка и индексация всех документов
+# 5. Загрузка и индексация
 @st.cache_data(ttl=3600)
 def load_and_index_all_docs():
     all_chunks = []
@@ -91,11 +106,10 @@ def load_and_index_all_docs():
             page_num = page_data["page"]
             page_text = page_data["text"]
             
-            # Разбиваем страницу на фрагменты
             chunks = split_text_smart(page_text, chunk_size=600, overlap=150)
             
             for chunk in chunks:
-                if len(chunk) > 50:  # Пропускаем слишком короткие
+                if len(chunk) > 50:
                     all_chunks.append({
                         "text": chunk,
                         "source": filename,
@@ -104,19 +118,15 @@ def load_and_index_all_docs():
     
     return all_chunks
 
-# 5. Улучшенный поиск с морфологией и подсветкой
-def search_chunks(chunks, query):
-    """Ищет фрагменты с учётом морфологии и частичного совпадения"""
-    # Разбиваем запрос на слова
+# 6. Поиск фрагментов
+def search_chunks(chunks, query, top_k=5):
     query_words = query.lower().split()
     
-    # Для каждого слова создаём варианты (упрощённая морфология)
     def get_word_variants(word):
         variants = [word]
-        # Убираем окончания (очень упрощённо)
         if len(word) > 4:
-            variants.append(word[:-1])  # убираем последнюю букву
-            variants.append(word[:-2])  # убираем две последние
+            variants.append(word[:-1])
+            variants.append(word[:-2])
         return variants
     
     query_variants = []
@@ -127,7 +137,6 @@ def search_chunks(chunks, query):
     for chunk in chunks:
         chunk_lower = chunk["text"].lower()
         
-        # Считаем количество совпадений
         score = 0
         matched_words = []
         
@@ -147,68 +156,113 @@ def search_chunks(chunks, query):
                 "matched_words": matched_words
             })
     
-    # Сортируем по количеству совпадений
     results.sort(key=lambda x: x["score"], reverse=True)
     
-    return results
+    return results[:top_k]
 
-# 6. Подсветка найденных слов в тексте
-def highlight_text(text, words):
-    """Подсвечивает найденные слова в тексте"""
-    highlighted = text
-    for word in words:
-        # Ищем слово в разных формах (упрощённо)
-        pattern = re.compile(re.escape(word[:4]) + r'\w*', re.IGNORECASE)
-        highlighted = pattern.sub(lambda m: f"**{m.group()}**", highlighted)
-    return highlighted
+# 7. Получение ответа от Groq (Llama 3)
+def get_ai_answer(question, context_chunks, api_key):
+    if not api_key:
+        return None, "API ключ не указан"
+    
+    # Формируем контекст из найденных фрагментов
+    context = "\n\n---\n\n".join([
+        f"[{chunk['source']}, стр. {chunk['page']}]\n{chunk['text']}"
+        for chunk in context_chunks
+    ])
+    
+    prompt = f"""Ты — эксперт по строительным нормам и правилам (СП, ГОСТ, СНиП). 
+Используй ТОЛЬКО предоставленный контекст из документов для ответа на вопрос.
+Если в контексте нет точного ответа, скажи об этом и предложи посмотреть конкретный документ.
+Всегда указывай номер пункта нормы и название документа.
 
-# 7. Основной интерфейс
+КОНТЕКСТ ИЗ ДОКУМЕНТОВ:
+{context}
+
+ВОПРОС: {question}
+
+ОТВЕТ:"""
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "llama3-70b-8192",
+        "messages": [
+            {"role": "system", "content": "Ты эксперт по строительным нормам. Отвечай точно по документам."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.1,
+        "max_tokens": 1024
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            answer = result["choices"][0]["message"]["content"]
+            return answer, None
+        else:
+            return None, f"Ошибка API: {response.status_code}"
+    except Exception as e:
+        return None, f"Ошибка: {str(e)}"
+
+# 8. Основной интерфейс
 with st.spinner("⏳ Индексация документов..."):
     chunks = load_and_index_all_docs()
 
 if not chunks:
-    st.warning("️ Не удалось извлечь текст из PDF. Возможно, это сканы.")
+    st.warning("️ Не удалось извлечь текст из PDF.")
 else:
-    st.success(f"✅ Готово! Проиндексировано **{len(chunks)}** фрагментов из **{len(pdf_files)}** файлов.")
+    st.success(f"✅ Загружено **{len(chunks)}** фрагментов из **{len(pdf_files)}** документов")
     
-    # Поле поиска
-    query = st.text_input(
-        "🔎 Что ищем?", 
-        placeholder="Например: пожарный выход, высота потолков, вентиляция кухня",
-        key="search_box",
-        help="Можно вводить несколько слов. Система найдёт фрагменты с наибольшим количеством совпадений."
+    st.divider()
+    
+    # Поле ввода вопроса
+    question = st.text_input(
+        "💬 Задайте вопрос:",
+        placeholder="Например: Сколько метров должно быть до пожарного выхода? Какая высота потолков в стоматологии?",
+        key="question_box",
+        help="Система найдёт релевантные фрагменты и ИИ сформулирует точный ответ"
     )
     
-    if query:
-        results = search_chunks(chunks, query)
-        
-        st.subheader(f"📊 Найдено результатов: {len(results)}")
-        
-        if len(results) == 0:
-            st.info("🔍 Ничего не найдено. Попробуйте:")
-            st.markdown("""
-            - Использовать другие слова или синонимы
-            - Вводить запрос короче (2-3 слова)
-            - Проверить орфографию
-            """)
+    if question:
+        if not groq_api_key:
+            st.error("⚠️ Сначала введите API ключ Groq в боковой панели")
         else:
-            # Показываем топ-20 результатов
-            st.markdown(f"Показаны лучшие **{min(20, len(results))}** результатов:")
-            
-            for i, result in enumerate(results[:20], 1):
-                chunk = result["chunk"]
-                matched_words = result["matched_words"]
+            with st.spinner(" Поиск в документах..."):
+                # Шаг 1: Поиск релевантных фрагментов
+                relevant_chunks = search_chunks(chunks, question, top_k=5)
                 
-                with st.container():
-                    # Заголовок с источником
-                    st.markdown(f"**{i}. 📄 `{chunk['source']}` (стр. {chunk['page']})**")
+                if not relevant_chunks:
+                    st.warning("🔍 Не найдено релевантных фрагментов. Попробуйте переформулировать вопрос.")
+                else:
+                    st.info(f"📄 Найдено {len(relevant_chunks)} релевантных фрагментов")
                     
-                    # Текст с подсветкой
-                    highlighted_text = highlight_text(chunk["text"], matched_words)
-                    st.markdown(highlighted_text)
+                    # Шаг 2: Получение ответа от ИИ
+                    with st.spinner("🤖 ИИ формулирует ответ..."):
+                        answer, error = get_ai_answer(question, relevant_chunks, groq_api_key)
                     
-                    # Найденные слова
-                    if matched_words:
-                        st.markdown(f"🏷️ Найдено слов: {', '.join(matched_words)}")
-                    
-                    st.markdown("---")
+                    if error:
+                        st.error(f"❌ {error}")
+                    else:
+                        # Показываем ответ от ИИ
+                        st.subheader("📝 Ответ:")
+                        st.markdown(answer)
+                        
+                        st.divider()
+                        
+                        # Показываем источники
+                        st.subheader("📚 Источники:")
+                        for i, result in enumerate(relevant_chunks, 1):
+                            chunk = result["chunk"]
+                            with st.expander(f"**{i}. {chunk['source']}** (стр. {chunk['page']})"):
+                                st.text(chunk["text"])
